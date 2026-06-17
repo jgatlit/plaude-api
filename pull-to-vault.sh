@@ -23,6 +23,10 @@ VAULT_DIR="${PLAUD_VAULT_DIR:-$HOME/vault/999 Inbox/Transcripts}"
 RAW_DIR="$VAULT_DIR/_raw"
 PLAUD="${PLAUD_CLI:-npx -y @plaud-ai/cli@latest}"
 LOG="$VAULT_DIR/.ingestion.log"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Structured per-record event ledger (see ledger.py). Best-effort — a ledger
+# failure must never fail a pull, hence the trailing `|| true` at each call site.
+ledger_emit() { python3 "$HERE/ledger.py" emit "$@" >/dev/null 2>&1 || true; }
 # Durable dedup ledger: full file_id per line. Survives downstream moves/renames
 # out of VAULT_DIR (the filename scan below only sees the inbox tree). This is the
 # authoritative skip gate that makes a wide discovery window (--days 90) safe.
@@ -78,6 +82,8 @@ for fid in "${ids[@]}"; do
   meta=$($PLAUD file "$fid" 2>/dev/null || true)
   if ! grep -q "^  name:" <<<"$meta"; then
     log "  ✗ metadata fetch failed for $fid"
+    ledger_emit --event error --stage L1-pull --file-id "$fid" --record "$fid" \
+      --detail '{"reason":"metadata fetch failed"}'
     failed=$((failed+1)); continue
   fi
 
@@ -86,6 +92,11 @@ for fid in "${ids[@]}"; do
   created=$(grep -E "^  created_at:" <<<"$meta" | sed -E 's/^  created_at:[[:space:]]+//')
   dur=$(grep -E "^  duration:" <<<"$meta" | sed -E 's/^  duration:[[:space:]]+//')
   serial=$(grep -E "^  serial_number:" <<<"$meta" | sed -E 's/^  serial_number:[[:space:]]+//')
+  # Plaud's deterministic content-surface availability flags (audio/transcript/
+  # summary) — the upstream-defined asset map, captured verbatim for the ledger.
+  avail_audio=$(grep -E "^  audio:" <<<"$meta" | sed -E 's/^  audio:[[:space:]]+//')
+  avail_transcript=$(grep -E "^  transcript:" <<<"$meta" | sed -E 's/^  transcript:[[:space:]]+//')
+  avail_summary=$(grep -E "^  summary:" <<<"$meta" | sed -E 's/^  summary:[[:space:]]+//')
 
   date_prefix=$(echo "${start:-$created}" | cut -dT -f1)
   short_id="${fid:0:8}"
@@ -98,7 +109,10 @@ for fid in "${ids[@]}"; do
 
   # Pull content
   $PLAUD transcript "$fid" -o "$tx_raw" >/dev/null 2>&1 || \
-    { log "  ✗ transcript pull failed for $fid"; failed=$((failed+1)); continue; }
+    { log "  ✗ transcript pull failed for $fid"; \
+      ledger_emit --event error --stage L1-pull --file-id "$fid" --record "$base" \
+        --title "$name" --detail '{"reason":"transcript pull failed"}'; \
+      failed=$((failed+1)); continue; }
   $PLAUD summary "$fid" -o "$sum_raw" >/dev/null 2>&1 || \
     log "  ⚠ summary pull failed for $fid (continuing without)"
 
@@ -147,6 +161,13 @@ for fid in "${ids[@]}"; do
 
   printf '%s\n' "$fid" >> "$LEDGER"   # record only on successful pull → failed transcripts retry next run
   log "  ✓ pulled $fid → $(basename "$md")"
+  # Structured event: assets auto-discovered from "$base"* (whatever the
+  # Generate template produced — not assumed to be transcript + summary only).
+  ledger_emit --event pulled --stage L1-pull --file-id "$fid" --record "$base" \
+    --title "$name" --recorded-at "$start" \
+    --detail "$(printf '{"recorded_at":"%s","duration_human":"%s","serial":"%s","plaud_surfaces":{"audio":"%s","transcript":"%s","summary":"%s"},"ai_summary":%s}' \
+                "$start" "$dur" "$serial" "$avail_audio" "$avail_transcript" "$avail_summary" \
+                "$([[ -s "$sum_raw" ]] && echo true || echo false)")"
   pulled=$((pulled+1))
 done
 

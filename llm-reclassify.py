@@ -30,6 +30,9 @@ import re
 import shutil
 import sys
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import ledger  # structured per-record event ledger (best-effort)
+
 VAULT = pathlib.Path.home() / "vault"
 TRANSCRIPTS = VAULT / "999 Inbox/Transcripts"
 UNCLASSIFIED = TRANSCRIPTS / "_unclassified"
@@ -168,6 +171,12 @@ def move_to_category(md_path: pathlib.Path, category: str, confidence: float,
         ])
         text = f"---\n{fm}\n---\n" + text[m.end():]
         new_md.write_text(text)
+        fid = ledger._read_frontmatter(new_md).get("plaud_file_id")
+        ledger.emit("reclassified", stage="LLM-reclassify", record=new_md, file_id=fid,
+                    title=ledger._read_frontmatter(new_md).get("title"),
+                    category=category, sync_blocked=category in SYNC_BLOCKED,
+                    detail={"router": "llm", "model": MODEL,
+                            "confidence": confidence, "reason": reason})
     return new_md
 
 

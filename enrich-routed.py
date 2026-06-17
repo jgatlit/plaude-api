@@ -34,6 +34,9 @@ import re
 import sys
 from typing import NamedTuple
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import ledger  # structured per-record event ledger (best-effort)
+
 VAULT = pathlib.Path.home() / "vault"
 TRANSCRIPTS = VAULT / "999 Inbox/Transcripts"
 ENTITIES_ROOT = VAULT / "300 Entities"
@@ -312,6 +315,13 @@ def process(md_path: pathlib.Path, entities: list[Entity], dry_run: bool) -> dic
     # Patch frontmatter
     if not dry_run:
         patch_frontmatter(md_path, [e.name for e in hits], action_target, vdc_added)
+        ledger.emit("enriched", stage="L3-enrich", record=md_path,
+                    file_id=fm.get("plaud_file_id"), title=title, category=category,
+                    sync_blocked=fm.get("sync_blocked"),
+                    entities=[e.name for e in hits],
+                    detail={"action_items": bool(action_target),
+                            "vdc_candidate": vdc_added,
+                            "action_items_rollup": action_target.stem if action_target else None})
 
     return {
         "skipped": False,

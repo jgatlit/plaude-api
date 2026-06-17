@@ -26,6 +26,9 @@ import re
 import shutil
 import sys
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import ledger  # structured per-record event ledger (best-effort)
+
 VAULT_DIR = pathlib.Path.home() / "vault/999 Inbox/Transcripts"
 RAW_DIR = VAULT_DIR / "_raw"
 LOG = VAULT_DIR / ".ingestion.log"
@@ -101,6 +104,12 @@ def route_one(md_path: pathlib.Path, dry_run: bool = False) -> tuple[str, bool]:
     new_md = target_dir / md_path.name
     if new_md.exists():
         update_frontmatter(new_md, category, sync_blocked)
+        # Event: record now lives in `target_dir`; assets re-discovered there
+        # (all sidecars moved together above), so `dir`/`assets` reflect reality.
+        fid = ledger._read_frontmatter(new_md).get("plaud_file_id")
+        ledger.emit("routed", stage="L2-route", record=new_md, file_id=fid,
+                    title=title, category=category, sync_blocked=sync_blocked,
+                    detail={"router": "keyword"})
     return category, sync_blocked
 
 
