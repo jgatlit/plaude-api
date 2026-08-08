@@ -113,6 +113,23 @@ for fid in "${ids[@]}"; do
       ledger_emit --event error --stage L1-pull --file-id "$fid" --record "$base" \
         --title "$name" --detail '{"reason":"transcript pull failed"}'; \
       failed=$((failed+1)); continue; }
+
+  # An un-transcribed recording returns exit 0 with an EMPTY transcript. Left
+  # unchecked, the loop below writes a content-free stub at "$base.md" — and the
+  # skip gate at the top of this loop then matches that stub by filename
+  # (*--${fid:0:8}.md) on every future run, so the recording can never be pulled
+  # again once transcription finishes. Recovery required moving the stub out of
+  # VAULT_DIR by hand (observed 2026-08-06: 3275cfe9, a 1h01m call, recovered
+  # manually the next morning). Treat empty as failure so it retries, per this
+  # loop's own contract: record only on successful pull.
+  tx_bytes=$(wc -c <"$tx_raw" 2>/dev/null || echo 0)
+  if [[ "$tx_bytes" -lt 32 ]]; then
+    log "  ⏳ transcript not ready for $fid (${tx_bytes}B) — no stub written, will retry"
+    rm -f "$tx_raw" "$sum_raw"
+    ledger_emit --event deferred --stage L1-pull --file-id "$fid" --record "$base" \
+      --title "$name" --detail "$(printf '{"reason":"transcript empty — upstream transcription pending","transcript_bytes":%s}' "$tx_bytes")"
+    skipped=$((skipped+1)); continue
+  fi
   $PLAUD summary "$fid" -o "$sum_raw" >/dev/null 2>&1 || \
     log "  ⚠ summary pull failed for $fid (continuing without)"
 
