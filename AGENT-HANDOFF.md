@@ -5,24 +5,28 @@ authority: live — backed by the structured event ledger, regenerate anytime
 index_primary: "~/vault/999 Inbox/Transcripts/.ingestion-events.jsonl"
 index_tooling: "~/apps/plaude-api/ledger.py  (emit | reconcile | query)"
 refresh: "python3 ~/apps/plaude-api/ledger.py reconcile"
-record_store: "~/vault (local Obsidian) — NOT the nobox/teamwork-vault MCP"
+record_store: "~/vault (local Obsidian) + nobox-vault federated source `plaud` (owner-only, kind = category)"
 source_of_truth: "Plaud cloud library (account 00c8bcf85ea94be19d22d4a363f1fd02, jgatlit@gmail.com)"
 access_local: "ledger.py query — no creds, reads on-disk index"
+access_federated: "nobox-vault MCP source_search / source_fetch, source `plaud` — only as jonathan@noboxai.com"
 access_source_cli: "@plaud-ai/cli — OAuth tokens at ~/.plaud/tokens.json"
 access_source_mcp: "Claude Code MCP server `plaud` — separate OAuth, port 8199"
 ---
 
 # Plaud Records — Agent Handoff & Search Guide
 
-You are consuming voice-recording records ingested from **Plaud** by the 4-stage
-pipeline at `~/apps/plaude-api/` (L1 pull → L2 route → LLM fallback → L3 enrich).
-This document is the **stable contract** for finding and reading them. Do not
-hand-walk the filesystem — query the ledger (Section 2). It already knows every
-record's current path, even after records are relocated/renamed out of the inbox.
+You are consuming voice-recording records ingested from **Plaud** by the pipeline at
+`~/apps/plaude-api/` (L1 pull → L2 route → LLM fallback → L3 enrich → L4 push to the
+nobox-vault `plaud` federated source). This document is the **stable contract** for
+finding and reading them. Do not hand-walk the filesystem — query the ledger
+(Section 2). It already knows every record's current path, even after records are
+relocated/renamed out of the inbox.
 
 **Decision rule — which surface to query:**
-- **Existing / already-ingested records** → the **local ledger** (Section 0.A → §2–3).
-  Default. No credentials. Covers everything pulled into the vault.
+- **Existing / already-ingested records, on this host** → the **local ledger**
+  (Section 0.A → §2–3). Default. No credentials. Covers everything pulled into the vault.
+- **Search by meaning or category, or from claude.ai / another host** → the
+  **nobox-vault federated source** (Section 0.C). Only works as jonathan@noboxai.com.
 - **Latest from source / not-yet-ingested / audio / raw assets** → the **Plaud
   live API** via MCP or CLI (Section 0.B). Needs OAuth.
 
@@ -31,10 +35,25 @@ record's current path, even after records are relocated/renamed out of the inbox
 ## 0. Access surfaces — endpoints & credentials
 
 > ⚠️ **"Vault" is overloaded — do not confuse two stores.** Plaud records live in
-> the **local Obsidian vault at `~/vault/`**, indexed by `ledger.py`. The
-> **`nobox-vault` / `teamwork-vault` MCP** (tools `artifact_*`, `task_*`,
-> `project_*`) is the team *knowledge* workspace — it does **not** hold Plaud
-> recordings. Querying it for recordings will return nothing relevant.
+> the **local Obsidian vault at `~/vault/`**, indexed by `ledger.py`, and are
+> **also pushed into nobox-vault as federated source items** (source `plaud`).
+> In nobox-vault they are **not artifacts**: `artifact_search` / `artifact_read`
+> will never find a recording. Use `source_search` / `source_fetch` (Section 0.C).
+
+### 0.C — nobox-vault federated source `plaud` (owner-only)
+
+| Thing | Value |
+|---|---|
+| Tools | `source_search` (hybrid keyword + semantic), `source_fetch` (full note body) |
+| Scope | Every recording note on disk, **all categories**, one item per Plaud `file_id` (`ext_id`) |
+| Segments | `kind` = category: `business`, `learning`, `personal-health`, `casual`, `unclassified` |
+| Examples | `source_search {sources:["plaud"], kind:"business", query:"pricing"}` · `source_search {sources:["plaud"], sort:"recent"}` · `source_fetch {source:"plaud", ext_id:"<32-hex file_id>"}` |
+| Who can read | **Only jonathan@noboxai.com** (source owner scoping). An agent/admin token gets zero hits by design — that is not an outage. |
+| Freshness | Pushed every 30 min by L4 (`teamwork-sync/ops/plaud-push.mjs`) |
+| Not there | Recordings not yet pulled to disk (pre-mid-May 2026 backlog: `tsk_7b94b005fe564480a600`), and recordings Plaud never transcribed |
+
+`personal-health` and `casual` items keep the `sync_blocked` guardrail in §4: fine to
+read for the operator, never for client-facing or shared output.
 
 ### 0.A — Local index (PRIMARY; no credentials)
 

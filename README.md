@@ -1,6 +1,6 @@
 # plaude-api — Plaud → Vault ingestion pipeline
 
-Continuously pulls Plaud voice recordings into the Obsidian vault, classifies them by topic, enriches with entity backlinks + action-item rollups + case-study candidates, and falls back to LLM classification when keyword rules miss. Runs every 30 minutes via systemd user timer.
+Continuously pulls Plaud voice recordings into the Obsidian vault, classifies them by topic, enriches with entity backlinks + action-item rollups + case-study candidates, and falls back to LLM classification when keyword rules miss. A final stage pushes every recording into the nobox-vault `plaud` federated source, tagged with its category. Runs every 30 minutes via systemd user timer.
 
 ## Pipeline stages
 
@@ -33,6 +33,12 @@ Continuously pulls Plaud voice recordings into the Obsidian vault, classifies th
 │          200 Notes/Value-Delivered/_candidates.md                            │
 │        → flips frontmatter: ingestion_status routed → enriched               │
 └──────────────────────────────────────────────────────────────────────────────┘
+      │
+      ▼
+ L4  ops/plaud-push.mjs  (teamwork-sync repo, run from its main checkout)
+        → pushes EVERY recording note to nobox-vault federated source `plaud`
+        → kind = category: business / learning / personal-health / casual / unclassified
+        → readable only by jonathan@noboxai.com (source owner scoping)
 ```
 
 ## Filesystem layout
@@ -43,14 +49,19 @@ Continuously pulls Plaud voice recordings into the Obsidian vault, classifies th
 ├── screen-and-route.py             # L2
 ├── llm-reclassify.py               # LLM fallback
 ├── enrich-routed.py                # L3
+├── ledger.py                       # structured event ledger (emit | reconcile | query)
+├── AGENT-HANDOFF.md                # how downstream agents find and read records
 └── README.md
 
+~/Documents/aiChemist.agency/teamwork-sync/ops/
+└── plaud-push.mjs                  # L4 (lives in the teamwork-sync repo)
+
 ~/.config/systemd/user/
-├── plaud-sync.service              # oneshot, 4 ExecStarts (L1 → L2 → LLM → L3)
+├── plaud-sync.service              # oneshot, 5 ExecStarts (L1 → L2 → LLM → L3 → L4)
 └── plaud-sync.timer                # OnCalendar=*:0/30, Persistent=true
 
 ~/.config/plaud-sync/
-├── env                             # ANTHROPIC_API_KEY=... (mode 600)
+├── env                             # ANTHROPIC_API_KEY=..., VAULT_BROKER_KEY=... (mode 600)
 └── env.example
 
 ~/vault/999 Inbox/Transcripts/
@@ -93,6 +104,9 @@ systemctl --user list-timers plaud-sync.timer
 # Re-enrich (entity scan / action items / VDC) without re-pulling
 ./enrich-routed.py --dry-run
 ./enrich-routed.py
+
+# Preview what L4 would push (counts by kind; no network, no credentials needed)
+node ~/Documents/aiChemist.agency/teamwork-sync/ops/plaud-push.mjs --dry
 ```
 
 ## L2 keyword classifier rules (priority order)
@@ -105,7 +119,7 @@ systemctl --user list-timers plaud-sync.timer
 | `Business`        | – | strategy, project, meeting, scoping, consultation, discovery, business, client, proposal, onboarding, kickoff, standup, review, integration, deployment, automation, pipeline, product demo |
 | `_unclassified`   | – | (fallback, picked up by LLM next stage) |
 
-Edit `screen-and-route.py` `RULES` to tune. Order matters — first match wins. `sync_blocked: true` is a frontmatter flag for downstream vault-sync logic to honor — no enforcement here, semantic only.
+Edit `screen-and-route.py` `RULES` to tune. Order matters — first match wins. `sync_blocked: true` is a frontmatter flag — no enforcement here, semantic only. L4 does not use it to exclude anything: every category is pushed, and the category travels as the item's `kind` (see L4 below).
 
 ## LLM classifier (Haiku 4.5)
 
@@ -128,6 +142,16 @@ To rotate the key: edit `~/.config/plaud-sync/env`. To disable LLM stage entirel
 
 After enrichment, transcript frontmatter is updated with `entity_mentions: [list]`, `action_items_rollup: [[date]]`, `vdc_candidate: true`, and `ingestion_status: enriched`. Files with `enriched` status are skipped on subsequent runs.
 
+## L4 federation push (nobox-vault)
+
+`ops/plaud-push.mjs` lives in the **teamwork-sync** repo; systemd runs it from the main checkout at `~/Documents/aiChemist.agency/teamwork-sync`, so a change to it is live only after it is merged **and** `git pull`ed there (no worker deploy).
+
+- **What goes in:** every Plaud recording note under `999 Inbox/Transcripts/` and `400 Resources/Transcripts/`, one item per `plaud_file_id`. Notes are found by their frontmatter on disk, not by the ledger's recorded paths (those go stale when notes are archived or renamed). `300 Entities/` notes are derived and excluded.
+- **Duplicates:** the fullest normal copy wins. A copy in `_no-transcript-fragments`, `_ingestion-duplicates`, `_inbox-duplicates-already-processed` or `_empty-stubs-superseded` counts only if it is the sole copy and still carries a real transcript.
+- **Segments:** the note's `category` becomes the item `kind` — `business`, `learning`, `personal-health`, `casual`, `unclassified`. Filter at search time: `source_search {sources:["plaud"], kind:"personal-health"}`. Search is hybrid keyword + semantic.
+- **Access:** the `plaud` source is owner-scoped, so only jonathan@noboxai.com can search or fetch these items — whichever key pushed them. An agent/admin token sees none, by design.
+- **Auth:** static `VAULT_BROKER_KEY` from `~/.config/plaud-sync/env` → `POST /source-ingest`. Idempotent upsert by `ext_id`; unchanged items are no-ops. Batches of 25; any failure exits 2 so the service shows FAILED.
+
 ## Authentication
 
 **Plaud CLI** — `@plaud-ai/cli` reads tokens from `~/.plaud/tokens.json`. When the token expires, run `plaud login` interactively (uses port 8199 — see `PORT_REALLOCATION_2026-05-23.md` in `~/projects/project-tracker/`).
@@ -136,6 +160,8 @@ After enrichment, transcript frontmatter is updated with `entity_mentions: [list
 
 **Anthropic** — `~/.config/plaud-sync/env` mode 600. Currently sourced from the same key already in use by project-tracker. Rotating the project-tracker key requires updating both locations.
 
+**nobox-vault** — `VAULT_BROKER_KEY` in the same env file, used only by L4. It is the vault's static `BROKER_API_KEY` (no expiry).
+
 ## Idempotency
 
 Every stage is safe to re-run:
@@ -143,12 +169,14 @@ Every stage is safe to re-run:
 - **L2** only processes files in `_raw/` — once moved to a bucket, never touched again
 - **LLM** only processes files in `_unclassified/`
 - **L3** skips files with `ingestion_status: enriched`
+- **L4** upserts by Plaud `file_id`; the vault writes nothing for an unchanged item
 - Entity backlinks, action-item blocks, and VDC candidate rows all check for existing content before appending
 
 ## What's NOT included (deliberately deferred)
 
-- **PII redaction enforcement** — `sync_blocked: true` is a semantic flag, not enforcement. Any future vault-sync (to remote, GitHub, etc.) must honor it. The vault is operator-trusted local-only at present.
+- **PII redaction enforcement** — `sync_blocked: true` is a semantic flag, not enforcement. Personal-Health and Casual recordings **are** pushed to nobox-vault, where owner scoping limits them to jonathan@noboxai.com. Any other sync (to a remote, GitHub, a shared or client-facing surface) must still honor the flag.
 - **Pluggable provider for LLM** — currently Anthropic-direct. Could swap to AI Gateway for failover/cost-tracking. Not done because direct Haiku 4.5 is already <$0.001/file.
 - **Webhook-driven ingestion** — Plaud's webhooks are on the B2B Transcription API, not the MCP/CLI surface. Would require a separate API key + provisioning. Polling at 30 min is fine for human-cadence recording.
 - **Auto-promotion of VDC candidates to /case-study-extract** — operator-curated only by design (see `case-study-extract` skill: "Operator-curated, never auto-fired"). The queue is a triage prompt, not an autopilot.
 - **Cross-recording entity disambiguation** — if "Maria" appears in two different recordings referring to two different people in the vault, both get the same backlink. Acceptable false-positive rate for v1.
+- **Backfill of pre-mid-May 2026 recordings** — held; tracked as nobox-vault task `tsk_7b94b005fe564480a600`.
