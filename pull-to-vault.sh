@@ -21,7 +21,10 @@ set -euo pipefail
 
 VAULT_DIR="${PLAUD_VAULT_DIR:-$HOME/vault/999 Inbox/Transcripts}"
 RAW_DIR="$VAULT_DIR/_raw"
-PLAUD="${PLAUD_CLI:-npx -y @plaud-ai/cli@latest}"
+# Pinned, not @latest: an unpinned CLI changed its id format under us on
+# 2026-09-15 and the pipeline went silently dry for 10 days (see the parser note
+# below). Bump deliberately, after checking `plaud recent` output still parses.
+PLAUD="${PLAUD_CLI:-npx -y @plaud-ai/cli@0.3.14}"
 LOG="$VAULT_DIR/.ingestion.log"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Structured per-record event ledger (see ledger.py). Best-effort — a ledger
@@ -49,9 +52,37 @@ fi
 if [[ $# -gt 0 ]]; then
   ids=("$@")
 else
-  # Parse `plaud recent --days N` — first whitespace-token of each data line is the 32-char hex id
-  mapfile -t ids < <($PLAUD recent --days "$days" 2>/dev/null \
-    | awk '/^[[:space:]]+[0-9a-f]{32}/{print $1}')
+  # Parse `plaud recent --days N` — first whitespace-token of each data line is the
+  # recording id. Until ~2026-09-15 the CLI printed a bare 32-char hex id; it now
+  # prints `of_<32hex>`. The old bare-only regex matched NOTHING against the new
+  # shape, so every run from 2026-09-15 logged "no recordings to pull" and exited 0
+  # while recordings sat unpulled in Plaud. Accept both shapes, and never let a
+  # parse miss masquerade as an empty listing.
+  recent_err=$(mktemp)
+  set +e
+  recent_out=$($PLAUD recent --days "$days" 2>"$recent_err")
+  rc=$?
+  set -e
+  if [[ $rc -ne 0 ]]; then
+    log "✗ plaud recent failed (exit $rc): $(head -c 300 "$recent_err" | tr '\n' ' ')"
+    rm -f "$recent_err"; exit 2
+  fi
+  rm -f "$recent_err"
+  # (mawk-safe: no alternation-with-anchor inside the regex — xt12's mawk panics on it)
+  mapfile -t ids < <(awk '/^[[:space:]]/ { t=$1; h=t; sub(/^of_/, "", h); if (h ~ /^[0-9a-f]+$/ && length(h) == 32) print t }' <<<"$recent_out")
+  # Fail LOUD, not empty: the listing's own count (header) and the number of lines
+  # carrying a 32-hex id are both independent of the parser. If either says there
+  # are recordings and the parser extracted none, the CLI output shape changed
+  # again — exit non-zero so systemd records a failure instead of "nothing new".
+  listed=$(grep -cE '[0-9a-f]{32}' <<<"$recent_out" || true)
+  header_n=$(sed -nE 's/.*Recordings in the last [0-9]+ days?: ([0-9]+).*/\1/p' <<<"$recent_out" | head -1)
+  if [[ ${#ids[@]} -eq 0 && ( "${listed:-0}" -gt 0 || "${header_n:-0}" -gt 0 ) ]]; then
+    log "✗ parser extracted 0 ids but the listing shows ${header_n:-?} recording(s) / ${listed:-0} id line(s) — plaud CLI output format changed? Refusing to report 'no recordings'."
+    exit 3
+  fi
+  if [[ -n "$header_n" && "$header_n" -ne ${#ids[@]} ]]; then
+    log "⚠ plaud recent reports $header_n recording(s) but the parser extracted ${#ids[@]} — check the CLI output shape"
+  fi
 fi
 
 [[ ${#ids[@]} -eq 0 ]] && { log "no recordings to pull"; exit 0; }
@@ -62,7 +93,12 @@ pulled=0
 skipped=0
 failed=0
 
-for fid in "${ids[@]}"; do
+for raw_id in "${ids[@]}"; do
+  # Ledger rows, filenames (*--<8hex>.md) and the L4 ext_id all key on the BARE hex
+  # id — the 184 ledger rows predate the `of_` prefix — while the CLI's file /
+  # transcript / summary commands now reject a bare id and need `of_<hex>`.
+  fid="${raw_id#of_}"
+  if [[ "$raw_id" == of_* ]]; then cli_id="$raw_id"; else cli_id="${PLAUD_ID_PREFIX-of_}$fid"; fi
   # Skip if already pulled. Two gates, OR'd:
   #   1. Ledger (authoritative) — survives downstream moves/renames/deletes.
   #   2. Inbox filename scan (legacy fallback) — catches files still awaiting routing.
@@ -79,7 +115,7 @@ for fid in "${ids[@]}"; do
   fi
 
   # Fetch canonical metadata via `plaud file` (key: value lines)
-  meta=$($PLAUD file "$fid" 2>/dev/null || true)
+  meta=$($PLAUD file "$cli_id" 2>/dev/null || true)
   if ! grep -q "^  name:" <<<"$meta"; then
     log "  ✗ metadata fetch failed for $fid"
     ledger_emit --event error --stage L1-pull --file-id "$fid" --record "$fid" \
@@ -108,7 +144,7 @@ for fid in "${ids[@]}"; do
   sum_raw="$base.summary.md"
 
   # Pull content
-  $PLAUD transcript "$fid" -o "$tx_raw" >/dev/null 2>&1 || \
+  $PLAUD transcript "$cli_id" -o "$tx_raw" >/dev/null 2>&1 || \
     { log "  ✗ transcript pull failed for $fid"; \
       ledger_emit --event error --stage L1-pull --file-id "$fid" --record "$base" \
         --title "$name" --detail '{"reason":"transcript pull failed"}'; \
@@ -130,7 +166,7 @@ for fid in "${ids[@]}"; do
       --title "$name" --detail "$(printf '{"reason":"transcript empty — upstream transcription pending","transcript_bytes":%s}' "$tx_bytes")"
     skipped=$((skipped+1)); continue
   fi
-  $PLAUD summary "$fid" -o "$sum_raw" >/dev/null 2>&1 || \
+  $PLAUD summary "$cli_id" -o "$sum_raw" >/dev/null 2>&1 || \
     log "  ⚠ summary pull failed for $fid (continuing without)"
 
   # Assemble unified .md

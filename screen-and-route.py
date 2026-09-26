@@ -34,8 +34,12 @@ RAW_DIR = VAULT_DIR / "_raw"
 LOG = VAULT_DIR / ".ingestion.log"
 
 # (category, sync_blocked, regex on title). First match wins.
+# Personal-Health MUST list every clinical term that could otherwise fall through to
+# Business ("consultation", "review") — Business/ is git-tracked and auto-committed to a
+# remote, so a miss here puts a clinical transcript into pushed history
+# (tsk_0fc189edf4574ff18c70). prenatal/perinatal/postpartum etc. added 2026-09-25.
 RULES = [
-    ("Personal-Health", True,  re.compile(r"\b(clinical|doctor|medical|ultrasound|appointment|visit|patient|diagnosis|prescription|OB|obstetric|fetal|pregnancy|gynec)\b", re.I)),
+    ("Personal-Health", True,  re.compile(r"\b(clinical|doctor|medical|ultrasound|appointment|visit|patient|diagnosis|prescription|OB|obstetric|fetal|pregnancy|gynec|prenatal|perinatal|antenatal|postnatal|postpartum|midwif\w*|doula|trimester|gestation\w*|SOAP note|birth[- ]prep|labou?r (?:and|&) delivery)\b", re.I)),
     ("Casual",          True,  re.compile(r"\b(casual chat|gathering|family|personal|life plan|date night|hangout|catch[- ]up)\b", re.I)),
     ("Learning",        False, re.compile(r"\b(lecture|course|training|tutorial|webinar|workshop|class|seminar)\b", re.I)),
     ("Business",        False, re.compile(r"\b(strategy|project|meeting|scoping|consultation|discovery|business|client|proposal|onboarding|kickoff|standup|review|integration|deployment|automation|pipeline|product demo|onsultation)\b", re.I)),
