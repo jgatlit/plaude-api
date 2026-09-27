@@ -1,0 +1,28 @@
+[Unit]
+Description=Plaud → Vault ingestion (L1 pull + L2 route + L3 enrich + LLM reclassify + L4 federation push)
+Documentation=file:///home/jgatlit/apps/plaude-api/README.md
+Documentation=file:///home/jgatlit/apps/plaude-api/sync-pipeline.sh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jgatlit/apps/plaude-api
+# Optional env file — ANTHROPIC_API_KEY for the LLM reclassifier, VAULT_BROKER_KEY for L4
+EnvironmentFile=-/home/jgatlit/.config/plaud-sync/env
+
+# ONE ExecStart, deliberately. This unit used to list the five pipeline stages as five
+# ExecStart= lines; systemd runs those sequentially and ABORTS THE REST on the first
+# non-zero exit, so a transient failure in L1 (a DNS blip on the Plaud listing) silently
+# skipped L2 routing, the LLM reclassifier, L3 enrichment and the L4 vault push for notes
+# already sitting on disk. sync-pipeline.sh runs every stage regardless, retries each one
+# (all five are idempotent), and emits a throttled operator notice for whatever is still
+# broken at the end. The stage list now lives in that script, next to the reasoning.
+ExecStart=/home/jgatlit/apps/plaude-api/sync-pipeline.sh
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=plaud-sync
+# The driver returns 0 (all stages ok) or 2 (at least one stage failed after its retries).
+# Only 0 is success — a failed stage must show up in `systemctl --user status`.
+SuccessExitStatus=0
