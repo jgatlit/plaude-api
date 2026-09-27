@@ -162,6 +162,82 @@ After enrichment, transcript frontmatter is updated with `entity_mentions: [list
 
 **nobox-vault** — `VAULT_BROKER_KEY` in the same env file, used only by L4. It is the vault's static `BROKER_API_KEY` (no expiry).
 
+## Retry behaviour
+
+Three different failure classes, three different mechanisms. They are not
+interchangeable, and treating them alike is what went wrong before 2026-09-27.
+
+| Failure | Example | Mechanism | Behaviour |
+|---|---|---|---|
+| **Transient** | DNS blip, upstream 5xx, `fetch failed` | `_retry.sh` → `retry_cmd` | Retried immediately in-run, exponential backoff (3s, 9s). Logs `↻ … recovered on attempt 2/3`. |
+| **Not ready yet** | Plaud has the audio but no transcript | `retry_state.py` | Retried later on a widening schedule, then escalated once and probed weekly. |
+| **Never going to work** | recording deleted upstream; a 3-second clip Plaud won't transcribe | `retry_state.py` → `notify.sh` | One Slack notice, then a weekly probe. Never abandoned outright. |
+
+### The backoff schedule
+
+Measured from a recording's **first** failure, not its last — otherwise a recording
+that has been failing for a month resets itself to hot-retry every time it fails again.
+
+```
+age < 2h    every run (~30 min)   transcription normally lands in this window
+age < 24h   every 2h
+age < 3d    every 6h
+age < 14d   every 24h
+age >= 14d  escalate once -> `stalled` -> weekly probe
+```
+
+A recording whose **metadata** fetch keeps failing is a different animal: it has been
+deleted or hidden upstream. Three strikes spanning at least 24h marks it `gone`,
+escalates once, and probes weekly.
+
+Success always wins: a pulled recording's row is deleted, and if it had been escalated
+the operator gets a `RECOVERED` notice so they hear the end of the story too.
+
+### Why this exists
+
+`plaud recent --days 90` re-offers every recording on every run, and the skip gate only
+knew about *successful* pulls. So anything that failed was re-attempted every 30 minutes
+forever. Measured 2026-09-27: **8,331 deferred events across 34 recordings**, the worst
+of them 1,682 attempts since 2026-08-10 — and not one operator notice, ever. Nine of the
+ten worst report `transcript: unavailable` at Plaud and were never going to succeed.
+
+At the same time, genuinely transient faults got **no** retry: one non-JSON HTTP 500
+from `/source-ingest` on 2026-09-18 failed the whole unit, while a manual re-run seconds
+later succeeded with `ingested=118`.
+
+### Stage isolation
+
+`plaud-sync.service` runs **one** `ExecStart`: `sync-pipeline.sh`. It used to list all
+five stages as five `ExecStart=` lines, and systemd aborts the remainder on the first
+non-zero exit — so a flaky Plaud listing silently skipped L2 routing, the reclassifier,
+L3 enrichment and the L4 vault push for notes already on disk. The driver runs every
+stage regardless, retries each one (all five are idempotent), and exits 2 if anything is
+still broken at the end.
+
+### Inspecting and operating it
+
+```bash
+# What is currently parked, and why
+python3 retry_state.py report
+
+# Force a recording back into the hot path (drops its backoff row)
+python3 retry_state.py note <file_id> pulled
+
+# Operator notices that were raised (survives a Slack outage)
+tail ~/vault/999\ Inbox/Transcripts/.operator-notices.log
+
+# Test the backoff logic without waiting days
+python3 test_retry_state.py
+```
+
+State lives in `~/vault/999 Inbox/Transcripts/.retry-state.json`, keyed by recording id.
+It deliberately carries **no titles** — Plaud titles routinely describe clinical content,
+and the same rule applies to every Slack notice this pipeline sends.
+
+Tunables (all env-overridable): `PLAUD_CLI_TRIES`, `PLAUD_CLI_BACKOFF`,
+`PLAUD_STAGE_TRIES`, `PLAUD_STAGE_BACKOFF`, `PLAUD_STALL_AFTER_SEC`,
+`PLAUD_GONE_STRIKES`, `PLAUD_COLD_PROBE_SEC`, `PLAUD_NOTIFY_GAP`.
+
 ## Idempotency
 
 Every stage is safe to re-run:
