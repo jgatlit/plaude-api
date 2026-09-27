@@ -7,3 +7,6 @@ env
 .venv/
 venv/
 tokens.json
+
+# Live-tree safety copies taken before an in-place edit; not repo content.
+*.bak-*

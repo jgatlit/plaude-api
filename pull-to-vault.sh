@@ -40,6 +40,21 @@ mkdir -p "$RAW_DIR"
 
 log() { printf '%s\n' "$(date -Is) $*" | tee -a "$LOG" >&2; }
 
+# --- Retry machinery ----------------------------------------------------------
+# Three distinct problems, three mechanisms — they are not interchangeable:
+#   _retry.sh      transient faults (network blip, upstream 5xx): retry NOW, in-run.
+#   retry_state.py definitive-for-now faults (transcript not generated yet): retry LATER,
+#                  on a widening schedule, and give up loudly instead of silently forever.
+#   notify.sh      the giving-up part: one operator notice per recording, ids only.
+# Before this, every failure class got the same treatment — one attempt, then wait 30
+# minutes and repeat identically, forever, telling nobody.
+# shellcheck source=_retry.sh
+source "$HERE/_retry.sh"
+CLI_TRIES="${PLAUD_CLI_TRIES:-3}"       # attempts per Plaud CLI call
+CLI_BACKOFF="${PLAUD_CLI_BACKOFF:-3}"   # seconds; 3s then 9s
+retry_state() { python3 "$HERE/retry_state.py" "$@" 2>/dev/null || true; }
+escalate() { "$HERE/notify.sh" "$@" >/dev/null 2>&1 || true; }
+
 # --- Resolve target file_ids ---------------------------------------------------
 ids=()
 days=1
@@ -59,8 +74,14 @@ else
   # while recordings sat unpulled in Plaud. Accept both shapes, and never let a
   # parse miss masquerade as an empty listing.
   recent_err=$(mktemp)
+  # The listing is the single point of failure for the entire run: if it fails, nothing
+  # downstream even learns there are recordings to fetch. Worse, this unit is a chain of
+  # ExecStart= lines, so a failure here also skipped L2-L4 for already-pulled notes.
+  # Wrapped in a function so the CLI's stderr still goes to $recent_err while retry_cmd's
+  # own diagnostics go to the journal.
+  _recent_once() { $PLAUD recent --days "$days" 2>"$recent_err"; }
   set +e
-  recent_out=$($PLAUD recent --days "$days" 2>"$recent_err")
+  recent_out=$(retry_cmd "plaud recent" "$CLI_TRIES" "$CLI_BACKOFF" -- _recent_once)
   rc=$?
   set -e
   if [[ $rc -ne 0 ]]; then
@@ -92,6 +113,7 @@ log "pull batch: ${#ids[@]} candidate id(s)"
 pulled=0
 skipped=0
 failed=0
+backoff_held=0   # skipped because their retry window has not reopened yet
 
 for raw_id in "${ids[@]}"; do
   # Ledger rows, filenames (*--<8hex>.md) and the L4 ext_id all key on the BARE hex
@@ -108,6 +130,19 @@ for raw_id in "${ids[@]}"; do
     continue
   fi
 
+  # Third gate: bounded retry. A recording that has already failed carries a backoff
+  # window, and hammering it before that window reopens is precisely what produced 8,331
+  # pointless attempts across 34 recordings (10 of them 200-1,680 times each, the oldest
+  # every 30 minutes since 2026-08-10). A recording never seen before passes straight
+  # through, so a genuinely new capture is never delayed by this.
+  decision=$(retry_state check "$fid")
+  if [[ "$decision" == SKIP* ]]; then
+    log "  ⏸ $fid not due for retry (${decision#SKIP })"
+    backoff_held=$((backoff_held+1))
+    skipped=$((skipped+1))
+    continue
+  fi
+
   if [[ "$DRY_RUN" == "1" ]]; then
     log "  ⟂ DRY-RUN would pull $fid"
     pulled=$((pulled+1))
@@ -115,11 +150,19 @@ for raw_id in "${ids[@]}"; do
   fi
 
   # Fetch canonical metadata via `plaud file` (key: value lines)
-  meta=$($PLAUD file "$cli_id" 2>/dev/null || true)
+  meta=$(retry_cmd "metadata $fid" "$CLI_TRIES" "$CLI_BACKOFF" -- quietly $PLAUD file "$cli_id" || true)
   if ! grep -q "^  name:" <<<"$meta"; then
-    log "  ✗ metadata fetch failed for $fid"
+    # Metadata that keeps failing after in-run retries is not a flaky network — the
+    # recording has been deleted or hidden upstream (observed: fb1c0c63, which vanished
+    # from Plaud during 2026-09 and had been re-attempted 249 times). retry_state marks it
+    # `gone` after 3 such runs spanning 24h, escalates once, then probes weekly.
+    log "  ✗ metadata fetch failed for $fid after $CLI_TRIES attempt(s)"
     ledger_emit --event error --stage L1-pull --file-id "$fid" --record "$fid" \
       --detail '{"reason":"metadata fetch failed"}'
+    verdict=$(retry_state note "$fid" meta-fail)
+    if [[ "$verdict" == ESCALATE* ]]; then
+      escalate "plaud-gone-${fid:0:8}" "Recording ${fid:0:8} looks gone from Plaud: its metadata fetch has failed on 3 separate runs over 24h+ (${verdict#ESCALATE }). I have stopped retrying it every 30 minutes and will probe it weekly instead. If you deleted it in Plaud, nothing to do."
+    fi
     failed=$((failed+1)); continue
   fi
 
@@ -143,8 +186,27 @@ for raw_id in "${ids[@]}"; do
   tx_raw="$base.transcript.txt"
   sum_raw="$base.summary.md"
 
+  # Ask before fetching. Plaud publishes its own per-surface availability flags, and they
+  # are the authoritative readiness signal — cheaper and more honest than pulling and
+  # discovering an empty file. All nine recordings that were being re-fetched every 30
+  # minutes for weeks report `transcript: unavailable` here: eight are 2-5 second clips
+  # Plaud will not transcribe at all, one is a real 23m27s recording whose upstream
+  # transcription failed. No number of retries turns any of them into a transcript.
+  if [[ -n "$avail_transcript" && "$avail_transcript" != "available" ]]; then
+    log "  ⏳ upstream transcript $avail_transcript for $fid (${dur:-?}) — deferring, not fetching"
+    ledger_emit --event deferred --stage L1-pull --file-id "$fid" --record "$base" \
+      --title "$name" \
+      --detail "$(printf '{"reason":"upstream transcript %s","plaud_surfaces":{"audio":"%s","transcript":"%s","summary":"%s"}}' \
+                  "$avail_transcript" "$avail_audio" "$avail_transcript" "$avail_summary")"
+    verdict=$(retry_state note "$fid" pending)
+    if [[ "$verdict" == ESCALATE* ]]; then
+      escalate "plaud-stalled-${fid:0:8}" "Recording ${fid:0:8} (recorded ${start:-?}, ${dur:-?}) has waited 14+ days for a transcript and Plaud still reports transcript: $avail_transcript (${verdict#ESCALATE }). Backing off to a weekly probe. The audio is still in Plaud if you want to re-run transcription there."
+    fi
+    skipped=$((skipped+1)); continue
+  fi
+
   # Pull content
-  $PLAUD transcript "$cli_id" -o "$tx_raw" >/dev/null 2>&1 || \
+  retry_cmd "transcript $fid" "$CLI_TRIES" "$CLI_BACKOFF" -- quietly $PLAUD transcript "$cli_id" -o "$tx_raw" || \
     { log "  ✗ transcript pull failed for $fid"; \
       ledger_emit --event error --stage L1-pull --file-id "$fid" --record "$base" \
         --title "$name" --detail '{"reason":"transcript pull failed"}'; \
@@ -158,16 +220,25 @@ for raw_id in "${ids[@]}"; do
   # VAULT_DIR by hand (observed 2026-08-06: 3275cfe9, a 1h01m call, recovered
   # manually the next morning). Treat empty as failure so it retries, per this
   # loop's own contract: record only on successful pull.
-  tx_bytes=$(wc -c <"$tx_raw" 2>/dev/null || echo 0)
+  # Test for the file rather than leaning on a failure path: when the CLI writes no file
+  # at all, `wc -c <"$tx_raw"` prints a bash redirect error into the journal on EVERY run
+  # (observed for fbb0d0cb and fcea9ddb) before `|| echo 0` quietly masks it.
+  if [[ -f "$tx_raw" ]]; then tx_bytes=$(wc -c <"$tx_raw"); else tx_bytes=0; fi
   if [[ "$tx_bytes" -lt 32 ]]; then
     log "  ⏳ transcript not ready for $fid (${tx_bytes}B) — no stub written, will retry"
     rm -f "$tx_raw" "$sum_raw"
     ledger_emit --event deferred --stage L1-pull --file-id "$fid" --record "$base" \
       --title "$name" --detail "$(printf '{"reason":"transcript empty — upstream transcription pending","transcript_bytes":%s}' "$tx_bytes")"
+    verdict=$(retry_state note "$fid" pending)
+    if [[ "$verdict" == ESCALATE* ]]; then
+      escalate "plaud-stalled-${fid:0:8}" "Recording ${fid:0:8} (recorded ${start:-?}, ${dur:-?}) has waited 14+ days and still returns an empty transcript (${verdict#ESCALATE }). Backing off to a weekly probe."
+    fi
     skipped=$((skipped+1)); continue
   fi
-  $PLAUD summary "$cli_id" -o "$sum_raw" >/dev/null 2>&1 || \
-    log "  ⚠ summary pull failed for $fid (continuing without)"
+  # Non-fatal by design (a note is worth having without its AI summary), but still worth
+  # a retry budget: a blip here silently downgrades the note's ai_summary to false.
+  retry_cmd "summary $fid" "$CLI_TRIES" "$CLI_BACKOFF" -- quietly $PLAUD summary "$cli_id" -o "$sum_raw" || \
+    log "  ⚠ summary pull failed for $fid after $CLI_TRIES attempt(s) (continuing without)"
 
   # Assemble unified .md
   {
@@ -214,6 +285,12 @@ for raw_id in "${ids[@]}"; do
 
   printf '%s\n' "$fid" >> "$LEDGER"   # record only on successful pull → failed transcripts retry next run
   log "  ✓ pulled $fid → $(basename "$md")"
+  # Clear any backoff row. If we had escalated this recording, close the loop — an
+  # operator told a recording stalled is owed the end of the story too.
+  verdict=$(retry_state note "$fid" pulled)
+  if [[ "$verdict" == RECOVERED* ]]; then
+    escalate "plaud-recovered-${fid:0:8}" "Recording ${fid:0:8} finally came through (${verdict#RECOVERED }) — the stall I flagged earlier has resolved itself and the note is in the vault inbox."
+  fi
   # Structured event: assets auto-discovered from "$base"* (whatever the
   # Generate template produced — not assumed to be transcript + summary only).
   ledger_emit --event pulled --stage L1-pull --file-id "$fid" --record "$base" \
@@ -224,5 +301,8 @@ for raw_id in "${ids[@]}"; do
   pulled=$((pulled+1))
 done
 
-log "pull batch done: pulled=$pulled skipped=$skipped failed=$failed"
+log "pull batch done: pulled=$pulled skipped=$skipped (backoff-held=$backoff_held) failed=$failed"
+# Print the retry ledger every run: a stalled recording should be visible in the journal
+# without anyone knowing to go looking for a state file.
+retry_state report | while IFS= read -r line; do log "  $line"; done
 echo "$pulled $skipped $failed"
